@@ -22,6 +22,8 @@ def log_doubleform(sender, tags_signature):
 
 def download_to_tmp(url):
     r = requests.get(url, stream=True)
+    print(r.status_code)
+    print(r.text)
     if r.status_code == 200:
         cont_type = r.headers.get("content-type")
 

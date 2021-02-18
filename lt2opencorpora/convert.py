@@ -6,7 +6,7 @@ import os.path
 import bz2file as bz2
 import codecs
 import logging
-import six
+import ujson
 
 import xml.etree.cElementTree as ET
 
@@ -16,9 +16,36 @@ from unicodecsv import DictReader
 from blinker import signal
 
 
-sys.stdout = codecs.getwriter('utf-8')(sys.stdout)
+# sys.stdout = codecs.getwriter('utf-8')(sys.stdout)
 doubleform_signal = signal('doubleform-found')
-strip_func = unicode.strip if six.PY2 else str.strip
+
+def getArr(details_string):
+    return [x for x in details_string
+            .replace("./", '/')
+            .replace(" ", '')
+            .split('.')
+            if x != ''
+           ]
+
+def infer_pos(arr):
+    if 'adj' in arr:
+        return 'adjective'
+    if set(arr) & {'f', 'n', 'm', 'm/f'}:
+        return 'noun'
+    if 'adv' in arr:
+        return 'adverb'
+    if 'conj' in arr:
+        return 'conjunction'
+    if 'prep' in arr:
+        return 'preposition'
+    if 'pron' in arr:
+        return 'pronoun';
+    if 'num' in arr:
+        return 'numeral';
+    if 'intj' in arr:
+        return 'interjection';
+    if 'v' in arr:
+        return 'verb';
 
 
 def open_any(filename):
@@ -53,11 +80,11 @@ class TagSet(object):
             for tag in r:
                 # lemma form column represents set of tags that wordform should
                 # have to be threatened as lemma.
-                tag["lemma form"] = filter(None, map(strip_func,
-                                           tag["lemma form"].split(",")))
+                tag["lemma form"] = filter(None, [s.strip() for s in
+                                           tag["lemma form"].split(",")])
 
                 tag["divide by"] = filter(
-                    None, map(strip_func, tag["divide by"].split(",")))
+                    None, [s.strip() for s in tag["divide by"].split(",")])
 
                 # opencopropra tags column maps LT tags to OpenCorpora tags
                 # when possible
@@ -138,35 +165,18 @@ class WordForm(object):
                 "|:rel|:neg|:ind|:gen)+)(.*)", "pron\\3\\2\\4", tags)
         self.form, self.tags = form, tags
 
-        self.tags = map(strip_func, self.tags.split(":"))
+        # self.tags = map(strip_func, self.tags.split(","))
+        self.tags = {s.strip() for s in self.tags}
         self.is_lemma = is_lemma
 
         # tags signature is string made out of sorted list of wordform tags
         # This is a workout for rare cases when some wordform has
         # noun:m:v_naz and another has noun:v_naz:m
-        self.tags_signature = ":".join(sorted(self.tags))
+        self.tags_signature = ",".join(sorted(self.tags))
 
         # Here we are trying to determine exact part of speech for this
         # wordform
-        pos_tags = list(filter(lambda x: x in tag_set.post, self.tags))
-        self.pos = ""
-
-        # And report cases when it's missing or wordform has more than two
-        # pos tags assigned
-        if len(pos_tags) == 0:
-            logging.debug(
-                "word form %s has no POS tag assigned" % self.form)
-        elif len(pos_tags) == 1:
-            self.pos = pos_tags[0]
-
-            if pos_tags[0] != self.tags[0]:
-                logging.debug(
-                    "word form %s has strange POS tag %s instead of %s"
-                    % (self.form, pos_tags[0], self.tags[0]))
-        else:
-            logging.debug(
-                "word form %s has more than one POS tag assigned: %s"
-                % (self.form, pos_tags))
+        self.pos = infer_pos(self.tags)
 
     def __str__(self):
         return "<%s: %s>" % (self.form, self.tags_signature)
@@ -195,6 +205,7 @@ class Lemma(object):
         return (self.word,) + tuple(self.common_tags)
 
     def add_form(self, form):
+        # print("lemma_form", self.lemma_form.form, '->', form)
         if self.common_tags is not None:
             self.common_tags = self.common_tags.intersection(form.tags)
         else:
@@ -220,12 +231,15 @@ class Lemma(object):
             ET.SubElement(el, "g", v=self.tag_set.lt2opencorpora[self.pos])
             tags = set(tags) - set([self.pos])
 
+        # TODO: translate tags here
+        '''
         tags = self.tag_set.sort_tags(tags)
 
         for tag in tags:
             # For rare cases when tag in the dict is not from tagset
             if tag in self.tag_set.lt2opencorpora:
                 ET.SubElement(el, "g", v=self.tag_set.lt2opencorpora[tag])
+        '''
 
     def export_to_xml(self, i, rev=1):
         lemma = ET.Element("lemma", id=str(i), rev=str(rev))
@@ -242,6 +256,7 @@ class Lemma(object):
 
         for forms in self.forms.values():
             for form in forms:
+                print(form.form, form.tags, self.lemma_form.form)
                 el = ET.Element("f", t=form.form.lower())
                 if form.is_lemma:
                     lemma.insert(1, el)
@@ -253,37 +268,121 @@ class Lemma(object):
 
         return lemma
 
+def yield_all_simple_adj_forms(forms_obj, pos):
+    if "casesSingular" in forms_obj:
+        forms_obj['singular'] = forms_obj['casesSingular']
+        forms_obj['plural'] = forms_obj['casesPlural']
+    for num in ['singular', 'plural']:
+        for case, content in forms_obj[num].items():
+            for i, animatedness in enumerate(["anim", "inan"]):
+                if case == "nom":
+                    if num == 'singular':
+                        yield content[0], {case, "sing", "masc", animatedness} | pos
+                        yield content[1], {case, "sing", "neut", animatedness} | pos
+                        yield content[2], {case, "sing", "femn", animatedness} | pos
+                    if num == 'plural':
+                        masc_form = content[0].split("/")
+                        yield masc_form[i], {case, "plur", "masc", animatedness} | pos
+                        yield content[1], {case, "plur", "neut", animatedness} | pos
+                        yield content[1], {case, "plur", "femn", animatedness} | pos
+                elif case == "acc":
+                    masc_form = content[0].split("/")
+                    if num == 'singular':
+                        yield masc_form[i], {case, "sing", "masc", animatedness} | pos
+                        yield content[1], {case, "sing", "neut", animatedness} | pos
+                        yield content[2], {case, "sing", "femn", animatedness} | pos
+                    if num == 'plural':
+                        yield masc_form[i], {case, "sing", "masc", animatedness} | pos
+                        yield content[1], {case, "sing", "neut", animatedness} | pos
+                        yield content[1], {case, "sing", "femn", animatedness} | pos
+                else:
+                    if num == 'singular':
+                        yield content[0], {case, "sing", "masc", animatedness} | pos
+                        yield content[0], {case, "sing", "neut", animatedness} | pos
+                        yield content[1], {case, "sing", "femn", animatedness} | pos
+                    if num == 'plural':
+                        yield content[0], {case, "plur", "masc", animatedness} | pos
+                        yield content[0], {case, "plur", "neut", animatedness} | pos
+                        yield content[0], {case, "plur", "femn", animatedness} | pos
+
+def yield_all_noun_forms(forms_obj, pos, columns):
+    for case, data in forms_obj.items():
+        for (form, form_name) in zip(data, columns):
+            if form is not None:
+                yield form, {case, form_name} | pos
+
+def iterate_json(forms_obj, pos_data, base):
+    pos = infer_pos(pos_data)
+    if isinstance(forms_obj, str) or pos is None:
+        # print(base, pos, pos_data)
+        return base, pos_data
+
+    if "adj" in pos:
+        yield from  yield_all_simple_adj_forms(forms_obj, pos_data)
+        content = forms_obj['comparison']
+        yield content['positive'][0], {"adjective", "positive"}
+        yield content['positive'][1], {"adverb", "positive"}
+        yield content['comparative'][0], {"adjective", "comparative"}
+        yield content['comparative'][1], {"adverb", "comparative"}
+    elif "numeral" in pos or 'pronoun' in pos:
+        print('extracting', base, pos)
+        if base in ["go", "iže", "jego", "on", "ona", "ono", "one", "oni", "jej", "jemu", "jih", "jihny", "jim", "jų", "mu"]:
+            print(pos)
+            print(base)
+            print(forms_obj)
+            return base, pos
+        print([[base]])
+        if forms_obj['type'] == 'adjective':
+            print("1, adj")
+            yield from  yield_all_simple_adj_forms(forms_obj, pos_data)
+        else:
+            print("1, smth else", forms_obj['type'])
+            columns = forms_obj['columns']
+            yield from yield_all_noun_forms(forms_obj['cases'], pos_data, columns)
+    elif "verb" in pos:
+        # print(pos)
+        # print(forms_obj)
+        # raise NotImplementedError
+        pass
+    elif "noun" in pos:
+        yield from yield_all_noun_forms(forms_obj, pos_data, ['singular', 'plural'])
+    return base, pos_data
+
+    
+base_tag_set = {}
+
 
 class Dictionary(object):
     def __init__(self, fname, mapping):
         if not mapping:
             mapping = os.path.join(os.path.dirname(__file__), "mapping.csv")
 
-        self.tag_set = TagSet(mapping)
+        # self.tag_set = TagSet(mapping)
         self.lemmas = {}
 
-        with open_any(fname)(fname, "r") as fp:
-            current_lemma = None
-
+        with open_any(fname)(fname, "r", encoding="utf8") as fp:
+            next(fp)
             for i, line in enumerate(fp):
-                if six.PY2:
-                    line = unicode(line.decode('utf-8'))
+                raw_data, forms, pos_formatted = line.split("\t")
+                word_id, isv_lemma, addition, pos, *rest = raw_data.split(",")
+                forms_obj = ujson.loads(forms)
+
                 # Here we've found a new lemma, let's add old one to the list
                 # and continue
-                if not line.startswith("  "):
-                    self.add_lemma(current_lemma)
 
-                    current_lemma = Lemma(
-                        *line.strip().split(" ", 1),
-                        tag_set=self.tag_set)
-                else:
-                    # It's a form of current lemma
+                details_set = set(getArr(pos))
+                current_lemma = Lemma(
+                    isv_lemma,
+                    tag_set=base_tag_set,
+                    lemma_form_tags=details_set,
+                )
+                for current_form, tag_set in iterate_json(forms_obj, details_set, isv_lemma):
                     current_lemma.add_form(WordForm(
-                        *line.strip().split(" ", 1),
-                        tag_set=self.tag_set
+                        current_form,
+                        tags=tag_set,
+                        tag_set=base_tag_set
                     ))
-
-            self.add_lemma(current_lemma)
+                self.add_lemma(current_lemma)
 
     def add_lemma(self, lemma):
         if lemma is not None:
@@ -292,10 +391,11 @@ class Dictionary(object):
     def export_to_xml(self, fname):
         root = ET.Element("dictionary", version="0.2", revision="1")
         tree = ET.ElementTree(root)
-        root.append(self.tag_set.export_to_xml())
+        # root.append(self.tag_set.export_to_xml())
         lemmata = ET.SubElement(root, "lemmata")
 
         for i, lemma in enumerate(self.lemmas.values()):
+            print(lemma)
             lemma_xml = lemma.export_to_xml(i + 1)
             if lemma_xml is not None:
                 lemmata.append(lemma_xml)
