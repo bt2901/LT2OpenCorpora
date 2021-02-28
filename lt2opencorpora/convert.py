@@ -11,6 +11,8 @@ import ujson
 import xml.etree.cElementTree as ET
 
 from unicodecsv import DictReader
+import unicodedata
+from string import whitespace
 
 # To add stats collection in inobstrusive way (that can be simply disabled)
 from blinker import signal
@@ -26,6 +28,44 @@ def getArr(details_string):
             .split('.')
             if x != ''
            ]
+
+diacr_letters = "žčšěйćżęų" 
+plain_letters = "жчшєjчжеу"
+
+
+lat_alphabet = "abcčdeěfghijjklmnoprsštuvyzž"
+cyr_alphabet = "абцчдеєфгхийьклмнопрсштувызж"
+
+
+save_diacrits = str.maketrans(diacr_letters, plain_letters)
+cyr2lat_trans = str.maketrans(cyr_alphabet, lat_alphabet)
+lat2cyr_trans = str.maketrans(lat_alphabet, cyr_alphabet)
+
+def lat2cyr(thestring):
+
+    # "e^" -> "ê"
+    # 'z\u030C\u030C\u030C' -> 'ž\u030C\u030C'
+    thestring = unicodedata.normalize(
+        'NFKC', 
+        thestring
+    ).lower().replace("\n", " ")
+
+    # remove all diacritics beside haceks/carons
+    thestring = unicodedata.normalize(
+        'NFKD',
+        thestring.translate(save_diacrits)
+    )
+    filtered = "".join(c for c in thestring if c in whitespace or c.isalpha())
+    # cyrillic to latin
+    filtered = filtered.replace(
+        "đ", "dž").replace(
+        # Serbian and Macedonian
+        "љ", "ль").replace("њ", "нь").replace(
+        # Russian
+        "я", "йа").replace("ю", "йу").replace("ё", "йо")
+        
+    return filtered.translate(lat2cyr_trans).replace("й", "ј").replace("ь", "ј")
+
 
 def infer_pos(arr):
     if 'adj' in arr:
@@ -48,6 +88,10 @@ def infer_pos(arr):
         return 'verb';
 
 
+# def translate_slovnik_tag(tag):
+
+
+
 def open_any(filename):
     """
     Helper to open also compressed files
@@ -59,6 +103,24 @@ def open_any(filename):
         return bz2.BZ2File
 
     return open
+
+
+def export_grammemes_description_to_xml(tag_set):
+    grammemes = ET.Element("grammemes")
+    for tag in tag_set.full.values():
+        grammeme = ET.SubElement(grammemes, "grammeme")
+        if tag["parent"] != "aux":
+            grammeme.attrib["parent"] = tag["parent"]
+        name = ET.SubElement(grammeme, "name")
+        name.text = tag["opencorpora tags"]
+
+        alias = ET.SubElement(grammeme, "alias")
+        alias.text = tag["name"]
+
+        description = ET.SubElement(grammeme, "description")
+        description.text = tag["description"]
+
+    return grammemes
 
 
 class TagSet(object):
@@ -73,9 +135,8 @@ class TagSet(object):
         self.groups = []
         self.lt2opencorpora = {}
 
-        mode = "r" if six.PY2 else "rb"
-        with open(fname, mode) as fp:
-            r = DictReader(fp)
+        with open(fname, 'rb') as fp:
+            r = DictReader(fp,delimiter=';')
 
             for tag in r:
                 # lemma form column represents set of tags that wordform should
@@ -134,23 +195,6 @@ class TagSet(object):
             return cmp(a_group, b_group)
 
         return sorted(tags, cmp=inner_cmp)
-
-    def export_to_xml(self):
-        grammemes = ET.Element("grammemes")
-        for tag in self.full.values():
-            grammeme = ET.SubElement(grammemes, "grammeme")
-            if tag["parent"] != "aux":
-                grammeme.attrib["parent"] = tag["parent"]
-            name = ET.SubElement(grammeme, "name")
-            name.text = tag["opencorpora tags"]
-
-            alias = ET.SubElement(grammeme, "alias")
-            alias.text = tag["name"]
-
-            description = ET.SubElement(grammeme, "description")
-            description.text = tag["description"]
-
-        return grammemes
 
 
 class WordForm(object):
@@ -226,22 +270,16 @@ class Lemma(object):
         else:
             self.forms[form.tags_signature] = [form]
 
-    def _add_tags_to_element(self, el, tags):
-        if self.pos in tags:
-            ET.SubElement(el, "g", v=self.tag_set.lt2opencorpora[self.pos])
-            tags = set(tags) - set([self.pos])
+    def _add_tags_to_element(self, el, tags, mapping):
+        # if self.pos in tags:
 
+        # TODO: remove common tags
+        # tags = set(tags) - set([self.pos])
         # TODO: translate tags here
-        '''
-        tags = self.tag_set.sort_tags(tags)
+        for one_tag in tags:
+            ET.SubElement(el, "g", v=mapping.lt2opencorpora.get(one_tag, one_tag))
 
-        for tag in tags:
-            # For rare cases when tag in the dict is not from tagset
-            if tag in self.tag_set.lt2opencorpora:
-                ET.SubElement(el, "g", v=self.tag_set.lt2opencorpora[tag])
-        '''
-
-    def export_to_xml(self, i, rev=1):
+    def export_to_xml(self, i, mapping, rev=1):
         lemma = ET.Element("lemma", id=str(i), rev=str(rev))
         common_tags = list(self.common_tags or set())
 
@@ -251,20 +289,24 @@ class Lemma(object):
 
             return None
 
-        l_form = ET.SubElement(lemma, "l", t=self.lemma_form.form.lower())
-        self._add_tags_to_element(l_form, common_tags)
+        output_lemma_form = self.lemma_form.form.lower()
+        output_lemma_form = lat2cyr(output_lemma_form)
+        l_form = ET.SubElement(lemma, "l", t=output_lemma_form)
+        self._add_tags_to_element(l_form, common_tags, mapping)
 
         for forms in self.forms.values():
             for form in forms:
-                print(form.form, form.tags, self.lemma_form.form)
-                el = ET.Element("f", t=form.form.lower())
+                output_form = form.form.lower()
+                output_form = lat2cyr(output_form)
+                el = ET.Element("f", t=output_form)
                 if form.is_lemma:
                     lemma.insert(1, el)
                 else:
                     lemma.append(el)
 
                 self._add_tags_to_element(el,
-                                          set(form.tags) - set(common_tags))
+                                          set(form.tags) - set(common_tags),
+                                          mapping)
 
         return lemma
 
@@ -325,20 +367,23 @@ def iterate_json(forms_obj, pos_data, base):
         yield content['comparative'][0], {"adjective", "comparative"}
         yield content['comparative'][1], {"adverb", "comparative"}
     elif "numeral" in pos or 'pronoun' in pos:
-        print('extracting', base, pos)
+        print('skipping', base, pos)
+        return base, pos
+        '''
         if base in ["go", "iže", "jego", "on", "ona", "ono", "one", "oni", "jej", "jemu", "jih", "jihny", "jim", "jų", "mu"]:
             print(pos)
             print(base)
             print(forms_obj)
             return base, pos
-        print([[base]])
+        # print([[base]])
         if forms_obj['type'] == 'adjective':
-            print("1, adj")
+            # print("1, adj")
             yield from  yield_all_simple_adj_forms(forms_obj, pos_data)
         else:
             print("1, smth else", forms_obj['type'])
             columns = forms_obj['columns']
             yield from yield_all_noun_forms(forms_obj['cases'], pos_data, columns)
+        '''
     elif "verb" in pos:
         # print(pos)
         # print(forms_obj)
@@ -355,8 +400,9 @@ base_tag_set = {}
 class Dictionary(object):
     def __init__(self, fname, mapping):
         if not mapping:
-            mapping = os.path.join(os.path.dirname(__file__), "mapping.csv")
+            mapping = os.path.join(os.path.dirname(__file__), "mapping_isv.csv")
 
+        self.mapping = mapping
         # self.tag_set = TagSet(mapping)
         self.lemmas = {}
 
@@ -364,24 +410,31 @@ class Dictionary(object):
             next(fp)
             for i, line in enumerate(fp):
                 raw_data, forms, pos_formatted = line.split("\t")
-                word_id, isv_lemma, addition, pos, *rest = raw_data.split(",")
+                word_id, isv_lemma, addition, pos, *rest = ujson.loads(raw_data)
                 forms_obj = ujson.loads(forms)
 
                 # Here we've found a new lemma, let's add old one to the list
                 # and continue
 
                 details_set = set(getArr(pos))
+                pos = infer_pos(details_set)
                 current_lemma = Lemma(
                     isv_lemma,
-                    tag_set=base_tag_set,
+                    tag_set={pos},
                     lemma_form_tags=details_set,
                 )
+                number_forms = set()
                 for current_form, tag_set in iterate_json(forms_obj, details_set, isv_lemma):
                     current_lemma.add_form(WordForm(
                         current_form,
                         tags=tag_set,
                         tag_set=base_tag_set
                     ))
+                    if pos in {"noun", "numeral"}:
+                        number_forms |= {one_tag for one_tag in tag_set if one_tag in ['singular', 'plural']}
+                if len(number_forms) == 1:
+                    numeric = {"Sgtm"} if number_forms == {"singular"} else {"Pltm"}
+                    current_lemma.tag_set |= numeric
                 self.add_lemma(current_lemma)
 
     def add_lemma(self, lemma):
@@ -389,14 +442,15 @@ class Dictionary(object):
             self.lemmas[lemma.lemma_signature] = lemma
 
     def export_to_xml(self, fname):
+        tag_set_full = TagSet(self.mapping)
         root = ET.Element("dictionary", version="0.2", revision="1")
         tree = ET.ElementTree(root)
-        # root.append(self.tag_set.export_to_xml())
+        root.append(export_grammemes_description_to_xml(tag_set_full))
         lemmata = ET.SubElement(root, "lemmata")
 
         for i, lemma in enumerate(self.lemmas.values()):
             print(lemma)
-            lemma_xml = lemma.export_to_xml(i + 1)
+            lemma_xml = lemma.export_to_xml(i + 1, tag_set_full)
             if lemma_xml is not None:
                 lemmata.append(lemma_xml)
 
